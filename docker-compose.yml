@@ -1,0 +1,89 @@
+name: telemetry-recovery-drill
+
+services:
+  # ---------- 原库：遥测源，持续入仓，演练期间不受影响 ----------
+  primary:
+    image: postgres:16
+    container_name: trd-primary
+    environment:
+      POSTGRES_DB: telemetry
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      TZ: Asia/Shanghai
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - "archive_command=test ! -f /wal_archive/%f && cp %p /wal_archive/%f"
+      - -c
+      - archive_timeout=60
+      - -c
+      - max_wal_senders=4
+    ports:
+      - "5432:5432"          # 便于用 psql 直接核查原库（可选）
+    volumes:
+      - pgdata_primary:/var/lib/postgresql/data
+      - wal_archive:/wal_archive
+      - ./primary/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d telemetry"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # ---------- 一次性初始化：造数 + 物理基线备份 + 两个命名恢复点 + 归档校验 + 清单 ----------
+  setup:
+    image: postgres:16
+    container_name: trd-setup
+    depends_on:
+      primary:
+        condition: service_healthy
+    volumes:
+      - ./setup/setup.sh:/opt/setup.sh:ro
+      - basebackup:/basebackup
+    entrypoint: ["/bin/bash", "/opt/setup.sh"]
+    restart: "no"
+
+  # ---------- 持续写入器：模拟原库继续入仓（恢复点之后的新数据） ----------
+  writer:
+    image: postgres:16
+    container_name: trd-writer
+    depends_on:
+      primary:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    volumes:
+      - ./writer/writer.sh:/opt/writer.sh:ro
+    command: ["/bin/bash", "/opt/writer.sh"]
+    restart: unless-stopped
+
+  # ---------- 演练台：FastAPI + 内嵌 PostgreSQL16 恢复实例 ----------
+  app:
+    build: ./app
+    container_name: trd-app
+    depends_on:
+      primary:
+        condition: service_healthy
+      setup:
+        condition: service_completed_successfully
+    environment:
+      PRIMARY_DSN: host=primary port=5432 dbname=telemetry user=postgres password=postgres
+      RECOVERY_PORT: "5433"        # 恢复实例仅监听容器内 127.0.0.1:5433，不对外暴露
+      RECOVERY_TIMEOUT: "300"
+      TZ: Asia/Shanghai            # 与原库一致，便于核对 recorded_at 显示
+    ports:
+      - "8080:8080"                # 浏览器入口 http://localhost:8080
+    volumes:
+      - wal_archive:/wal_archive:ro
+      - basebackup:/basebackup:ro
+      - recovery_runs:/recovery
+
+volumes:
+  pgdata_primary:
+  wal_archive:
+  basebackup:
+  recovery_runs:

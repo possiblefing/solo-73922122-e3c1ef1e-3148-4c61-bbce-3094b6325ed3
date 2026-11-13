@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>遥测恢复演练台</title>
+<style>
+:root{--bg:#0f1420;--card:#182036;--line:#2a3554;--fg:#dbe4ff;--mut:#8b98c0;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--acc:#60a5fa}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 "PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 22px;border-bottom:1px solid var(--line);background:#0c101b}
+h1{font-size:18px;margin:0}
+.badge{padding:3px 12px;border-radius:999px;font-weight:600;font-size:12px;border:1px solid var(--line)}
+.b-IDLE{background:#1f2937;color:#9ca3af}
+.b-PREPARING,.b-RECOVERING,.b-VERIFYING{background:#3b2f0b;color:var(--warn)}
+.b-READY{background:#052e1b;color:var(--ok)}
+.b-FAILED{background:#3b0d0d;color:var(--bad)}
+main{max-width:1180px;margin:0 auto;padding:18px;display:grid;gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
+.card h2{margin:0 0 10px;font-size:15px;color:#aec2ff}
+.mut{color:var(--mut)}.small{font-size:12px}
+table{border-collapse:collapse;width:100%;margin:6px 0}
+th,td{border:1px solid var(--line);padding:5px 9px;text-align:left;font-size:13px}
+th{background:#10182c;color:#9fb2e8}
+.ok{color:var(--ok);font-weight:700}.bad{color:var(--bad);font-weight:700}.warn{color:var(--warn)}
+button{background:var(--acc);border:0;color:#06122b;font-weight:700;padding:8px 16px;border-radius:8px;cursor:pointer}
+button:disabled{opacity:.4;cursor:not-allowed}
+button.ghost{background:#263154;color:var(--fg)}
+button.danger{background:var(--bad);color:#2b0505}
+pre{white-space:pre-wrap;word-break:break-all;background:#0a0e18;border:1px solid var(--line);border-radius:8px;padding:10px;max-height:260px;overflow:auto;font-size:12px;color:#a9b8e8;margin:6px 0}
+.rp{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:6px 0;cursor:pointer;display:block}
+.rp:hover{border-color:var(--acc)}
+.rp input{margin-right:8px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:900px){.grid2{grid-template-columns:1fr}}
+.step{display:flex;gap:8px;align-items:center;margin:4px 0;color:var(--mut)}
+.step.on{color:var(--warn)}.step.done{color:var(--ok)}.step.err{color:var(--bad)}
+.hidden{display:none}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px;margin:6px 0}
+.kv>div{background:#10182c;border:1px solid var(--line);border-radius:8px;padding:8px 10px}
+.kv b{display:block;font-size:17px}
+select,input[type=number]{background:#0a0e18;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--warn);font-size:13px}
+.errbox{background:#3b0d0d;border:1px solid #7f1d1d;border-radius:8px;padding:10px 12px;margin:6px 0}
+</style>
+</head>
+<body>
+<header>
+  <h1>🛰️ 遥测恢复演练台</h1>
+  <span id="stateBadge" class="badge b-IDLE">加载中…</span>
+  <span class="mut small">物理基线备份 + WAL 归档重放 · 精确停在命名恢复点 · 原库持续入仓不受影响</span>
+</header>
+<main>
+  <div class="grid2">
+    <section class="card">
+      <h2>① 原库实时状态（持续入仓中）</h2>
+      <div id="primaryBody" class="mut">加载中…</div>
+    </section>
+
+    <section class="card">
+      <h2>② 恢复编排</h2>
+      <div id="manifestNote" class="mut small">加载清单中…</div>
+      <div id="rpList"></div>
+      <label class="chk" id="faultWrap" style="display:none">
+        <input type="checkbox" id="injectFault"/>
+        <span>注入故障：模拟 WAL 归档缺段（段 <code id="missingSeg"></code> 将被“丢失”），用于演示“未到达目标恢复点”的失败路径</span>
+      </label>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
+        <button id="startBtn" onclick="startRecovery()" disabled>启动恢复</button>
+        <span class="small mut">全站同时只允许一份恢复；恢复实例为独立副本，原库不受影响</span>
+      </div>
+    </section>
+  </div>
+
+  <section class="card">
+    <h2>③ 恢复进度</h2>
+    <div id="steps"></div>
+    <div id="runMeta" class="small mut"></div>
+    <div id="events"></div>
+    <h2 style="margin-top:12px">恢复实例日志（postgres）</h2>
+    <pre id="logTail">（暂无）</pre>
+  </section>
+
+  <section class="card hidden" id="resultCard">
+    <h2>④ 恢复结果核对（已确认到达目标恢复点）</h2>
+    <div id="resultBody"></div>
+    <h2 style="margin-top:14px">恢复库实际遥测记录查询</h2>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:6px 0">
+      <select id="fDevice"></select>
+      <select id="fMetric"></select>
+      <label class="small mut">行数 <input type="number" id="fLimit" value="50" min="1" max="500" style="width:80px"/></label>
+      <button class="ghost" onclick="queryRows()">查询</button>
+      <span class="small mut">默认筛选即“误删集”：WX-03 / temperature，可直接核对误删前数据</span>
+    </div>
+    <div id="rowsBody"></div>
+    <div style="margin-top:12px">
+      <button class="danger" onclick="reclaim()">回收当前恢复库（停止实例并删除副本，之后可再次恢复）</button>
+    </div>
+  </section>
+
+  <section class="card hidden" id="failedCard">
+    <h2>④ 恢复失败</h2>
+    <div class="errbox" id="failedBody"></div>
+    <div class="small mut">恢复进程已停止并回收，失败残库不开放查询。必须回收残库后才允许重试。</div>
+    <div style="margin-top:10px">
+      <button class="danger" onclick="reclaim()">回收残库并重置（之后可重新发起恢复）</button>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const STATE_CN = {IDLE:'空闲',PREPARING:'准备中',RECOVERING:'WAL 重放中',VERIFYING:'校验目标中',READY:'已到达目标 · 结果开放',FAILED:'失败（进程已回收）'};
+const STEPS = [
+  ['PREPARING','① 复制物理基线备份 / 写入恢复配置'],
+  ['RECOVERING','② 启动恢复实例，从 WAL 归档重放'],
+  ['VERIFYING','③ 校验是否准确停在目标恢复点'],
+  ['READY','④ 确认到达目标，开放结果查询'],
+];
+let manifest = null, curState = 'IDLE', filtersInit = false;
+
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const t = await r.text();
+  let j; try{ j = JSON.parse(t); }catch{ j = {raw:t}; }
+  if(!r.ok){ const e = new Error(j.detail || r.statusText); e.status = r.status; throw e; }
+  return j;
+}
+
+async function loadManifest(){
+  try{
+    manifest = await api('/api/manifest');
+    $('#manifestNote').textContent = '';
+    renderPlan();
+  }catch(e){
+    $('#manifestNote').textContent = '等待 setup 完成（正在生成基线备份与命名恢复点）…';
+    setTimeout(loadManifest, 3000);
+  }
+}
+
+function renderPlan(){
+  if(!manifest) return;
+  const idle = curState === 'IDLE';
+  const prev = document.querySelector('input[name=rp]:checked')?.value;
+  $('#rpList').innerHTML = manifest.restore_points.map(rp => `
+    <label class="rp">
+      <input type="radio" name="rp" value="${esc(rp.name)}" ${idle?'':'disabled'} ${prev===rp.name?'checked':''}/>
+      <b>${esc(rp.name)}</b> <span class="mut small">@ ${esc(rp.lsn)} · ${esc(rp.created_at)}</span><br/>
+      <span class="small">${esc(rp.note)}</span><br/>
+      <span class="small mut">预期：总行数 ${rp.expected_total} · 误删集 ${rp.deleted_set_rows} 行 · 最新 recorded_at ${esc(rp.max_recorded_at)}</span>
+    </label>`).join('');
+  $('#missingSeg').textContent = manifest.first_wal_after_backup || '';
+  $('#faultWrap').style.display = 'flex';
+  $('#injectFault').disabled = !idle;
+  $('#startBtn').disabled = !idle;
+}
+
+async function pollPrimary(){
+  try{
+    const s = await api('/api/primary/stats');
+    if(!s.reachable){ $('#primaryBody').innerHTML = '<span class="bad">原库不可达：'+esc(s.error)+'</span>'; return; }
+    $('#primaryBody').innerHTML = `
+      <div class="kv">
+        <div><span class="mut small">遥测总行数（持续增长）</span><b>${s.total}</b></div>
+        <div><span class="mut small">入仓心跳行数（WX-LIVE）</span><b>${s.live_rows}</b></div>
+        <div><span class="mut small">最新 recorded_at</span><b style="font-size:12px">${esc(s.latest_recorded_at)}</b></div>
+        <div><span class="mut small">已归档 WAL 段数</span><b>${s.archiver.archived_count}</b></div>
+      </div>
+      <div class="small mut">最近归档段 ${esc(s.archiver.last_archived_wal)} @ ${esc(s.archiver.last_archived_time)} · 归档失败 ${s.archiver.failed_count} 次</div>
+      <div class="small ok">✔ 原库持续入仓中，恢复演练与其互不影响（心跳数据在恢复点之后产生，不会出现在恢复库）</div>`;
+  }catch(e){ $('#primaryBody').innerHTML = '<span class="bad">'+esc(e.message)+'</span>'; }
+}
+
+async function pollStatus(){
+  let s;
+  try{ s = await api('/api/status'); }catch(e){ return; }
+  curState = s.state;
+  const badge = $('#stateBadge');
+  badge.className = 'badge b-' + s.state;
+  badge.textContent = STATE_CN[s.state] || s.state;
+  renderPlan();
+  renderProgress(s);
+  $('#resultCard').classList.toggle('hidden', s.state !== 'READY');
+  $('#failedCard').classList.toggle('hidden', s.state !== 'FAILED');
+  if(s.state === 'READY') await renderResult();
+  if(s.state === 'FAILED') renderFailed(s);
+}
+
+function renderProgress(s){
+  const order = ['PREPARING','RECOVERING','VERIFYING','READY'];
+  const cur = s.state === 'FAILED' ? (s.run && s.run.error ? failStage(s) : 0) : order.indexOf(s.state);
+  $('#steps').innerHTML = s.run ? STEPS.map(([k,label],i) => {
+    let cls = '', icon = '○';
+    if(s.state === 'FAILED' && i === cur){ cls = 'err'; icon = '✗'; }
+    else if(i < cur || s.state === 'READY'){ cls = 'done'; icon = '✓'; }
+    else if(i === cur){ cls = 'on'; icon = '▶'; }
+    return `<div class="step ${cls}">${icon} ${label}</div>`;
+  }).join('') : '<div class="mut small">空闲：选择恢复点后点击“启动恢复”。</div>';
+  if(s.run){
+    $('#runMeta').innerHTML =
+      `任务 <code>${esc(s.run.id)}</code> · 目标恢复点 <code>${esc(s.run.restore_point)}</code>` +
+      (s.run.inject_fault ? ` · <span class="warn">已注入归档缺段（${esc(s.run.missing_segment)}）</span>` : '') +
+      (s.run.replay_lsn ? ` · 已重放至 LSN <code>${esc(s.run.replay_lsn)}</code>（${esc(s.run.replay_ts || '')}）` : '') +
+      ` · 开始于 ${esc(s.run.started_at)}`;
+    $('#events').innerHTML = s.run.events.slice(-10).map(e =>
+      `<div class="small mut">[${esc(e.ts)}] ${esc(e.msg)}</div>`).join('');
+  } else {
+    $('#runMeta').textContent = ''; $('#events').textContent = '';
+  }
+  $('#logTail').textContent = s.log_tail || '（暂无）';
+}
+
+function failStage(s){
+  // 根据事件推断失败时所处阶段，用于步骤条红叉位置
+  const msgs = (s.run.events || []).map(e => e.msg).join('');
+  if(msgs.includes('校验') || msgs.includes('提升')) return 2;
+  if(msgs.includes('重放') || msgs.includes('启动恢复实例')) return 1;
+  return 0;
+}
+
+async function renderResult(){
+  let sum;
+  try{ sum = await api('/api/recovered/summary'); }catch(e){ return; }
+  const rps = manifest ? manifest.restore_points : [];
+  const rowsDef = [
+    {label:'遥测总行数', a:rps[0]?.expected_total, b:rps[1]?.expected_total, chk:sum.checks[0]},
+    {label:'误删集行数（WX-03 / temperature）', a:rps[0]?.deleted_set_rows, b:rps[1]?.deleted_set_rows, chk:sum.checks[1]},
+    {label:'最新 recorded_at', a:rps[0]?.max_recorded_at, b:rps[1]?.max_recorded_at, chk:sum.checks[2]},
+  ];
+  $('#resultBody').innerHTML = `
+    <div class="small ok">✔ 日志确认 recovery stopping at restore point "${esc(sum.restore_point)}" 且 archive recovery complete，pg_is_in_recovery()=false —— 结果开放</div>
+    <table>
+      <tr><th>核对项</th><th>${esc(rps[0]?.name || '')}（预期）</th><th>${esc(rps[1]?.name || '')}（预期）</th><th>当前恢复库（实际，${esc(sum.restore_point)}）</th></tr>
+      ${rowsDef.map(r => `<tr><td>${esc(r.label)}</td><td>${esc(r.a ?? '')}</td><td>${esc(r.b ?? '')}</td><td class="${r.chk && r.chk.ok ? 'ok' : 'bad'}">${esc(r.chk ? r.chk.actual : '')} ${r.chk ? (r.chk.ok ? '✓' : '✗') : ''}</td></tr>`).join('')}
+    </table>
+    <div class="small mut">两个恢复点的差异：${esc(rps[0]?.name || '')} 含误删集 ${rps[0]?.deleted_set_rows ?? ''} 行 / 无批次2；${esc(rps[1]?.name || '')} 误删集 0 行 / 含批次2。当前恢复库与所选恢复点逐项一致即核对通过。</div>
+    <h2 style="margin-top:12px">设备 × 指标 行数矩阵（恢复库实际）</h2>
+    ${matrixTable(sum.matrix)}
+    <div class="small mut">记录时间范围：${esc(sum.min_recorded_at)} ~ ${esc(sum.max_recorded_at)}（恢复点之后产生的 WX-LIVE 心跳不会出现）</div>`;
+  if(!filtersInit){
+    const devices = [...new Set(sum.matrix.map(r => r.device_id))].sort();
+    const metrics = [...new Set(sum.matrix.map(r => r.metric))].sort();
+    $('#fDevice').innerHTML = '<option value="">全部设备</option>' + devices.map(d => `<option ${d==='WX-03'?'selected':''}>${esc(d)}</option>`).join('');
+    $('#fMetric').innerHTML = '<option value="">全部指标</option>' + metrics.map(m => `<option ${m==='temperature'?'selected':''}>${esc(m)}</option>`).join('');
+    filtersInit = true;
+    queryRows();
+  }
+}
+
+function matrixTable(matrix){
+  const devices = [...new Set(matrix.map(r => r.device_id))].sort();
+  const metrics = [...new Set(matrix.map(r => r.metric))].sort();
+  const get = (d,m) => (matrix.find(r => r.device_id===d && r.metric===m) || {}).count ?? 0;
+  return `<table><tr><th>设备</th>${metrics.map(m=>`<th>${esc(m)}</th>`).join('')}</tr>` +
+    devices.map(d => `<tr><td>${esc(d)}</td>${metrics.map(m=>`<td>${get(d,m)}</td>`).join('')}</tr>`).join('') +
+    `</table>`;
+}
+
+async function queryRows(){
+  const d = $('#fDevice').value, m = $('#fMetric').value, l = $('#fLimit').value || 50;
+  const q = new URLSearchParams(); if(d) q.set('device_id', d); if(m) q.set('metric', m); q.set('limit', l);
+  try{
+    const r = await api('/api/recovered/rows?' + q.toString());
+    $('#rowsBody').innerHTML = r.rows.length === 0
+      ? '<div class="warn small">0 行 —— 该筛选条件下恢复库中无记录（若筛选的是误删集，说明此恢复点位于误删之后）</div>'
+      : `<div class="small mut">返回 ${r.rows.length} 行</div>
+        <table><tr><th>id</th><th>设备</th><th>站点</th><th>指标</th><th>值</th><th>recorded_at</th><th>ingested_at</th></tr>
+        ${r.rows.map(x => `<tr><td>${x.id}</td><td>${esc(x.device_id)}</td><td>${esc(x.site)}</td><td>${esc(x.metric)}</td><td>${x.value}</td><td class="small">${esc(x.recorded_at)}</td><td class="small">${esc(x.ingested_at)}</td></tr>`).join('')}</table>`;
+  }catch(e){
+    $('#rowsBody').innerHTML = '<div class="bad small">查询被拒绝：' + esc(e.message) + '</div>';
+  }
+}
+
+function renderFailed(s){
+  const r = s.run || {};
+  $('#failedBody').innerHTML =
+    `<b>失败原因：</b>${esc(r.error || '未知')}<br/>` +
+    (r.inject_fault ? `<span class="warn small">本次注入了归档缺段故障（段 ${esc(r.missing_segment)} 缺失），失败符合预期。</span><br/>` : '') +
+    `<span class="small mut">任务 ${esc(r.id || '')} · 目标恢复点 ${esc(r.restore_point || '')}</span>`;
+}
+
+async function startRecovery(){
+  const sel = document.querySelector('input[name=rp]:checked');
+  if(!sel){ alert('请先选择一个恢复点'); return; }
+  try{
+    await api('/api/recover', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({restore_point: sel.value, inject_fault: $('#injectFault').checked}),
+    });
+    filtersInit = false;
+    pollStatus();
+  }catch(e){ alert('启动失败：' + e.message); }
+}
+
+async function reclaim(){
+  try{
+    await api('/api/reclaim', {method:'POST'});
+    filtersInit = false;
+    $('#rowsBody').innerHTML = '';
+    pollStatus();
+  }catch(e){ alert('回收失败：' + e.message); }
+}
+
+loadManifest();
+pollPrimary();
+pollStatus();
+setInterval(pollStatus, 1500);
+setInterval(pollPrimary, 3000);
+</script>
+</body>
+</html>
