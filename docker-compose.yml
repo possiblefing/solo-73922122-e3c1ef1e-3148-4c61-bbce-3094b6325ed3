@@ -65,6 +65,9 @@ services:
   app:
     build: ./app
     container_name: trd-app
+    # 允许容器内 gosu postgres 停止/启动恢复实例；init 负责转发信号并回收僵尸进程
+    init: true
+    stop_signal: SIGTERM
     depends_on:
       primary:
         condition: service_healthy
@@ -74,7 +77,17 @@ services:
       PRIMARY_DSN: host=primary port=5432 dbname=telemetry user=postgres password=postgres
       RECOVERY_PORT: "5433"        # 恢复实例仅监听容器内 127.0.0.1:5433，不对外暴露
       RECOVERY_TIMEOUT: "300"
+      # 关闭收尾等待上限（秒）：超时只报“未能干净收尾”并保留副本，不会提前删副本
+      SHUTDOWN_THREAD_GRACE: "60"
+      SHUTDOWN_CMD_GRACE: "90"
+      # “重放中”关闭演示的逐段重放延迟（毫秒），仅该停点生效
+      REPLAY_DEMO_DELAY_MS: "800"
+      # 可选：开机即在某个停点停住（copy / handoff / replay），一般由页面选择
+      # DEMO_CLOSE_POINT: "handoff"
+      # DEMO_CLOSE_DELAY: "60"
       TZ: Asia/Shanghai            # 与原库一致，便于核对 recorded_at 显示
+    # 正常关闭使用 SIGTERM；需给足收尾时间（默认 10s 不够等待在途任务）
+    stop_grace_period: 300s
     ports:
       - "8080:8080"                # 浏览器入口 http://localhost:8080
     volumes:

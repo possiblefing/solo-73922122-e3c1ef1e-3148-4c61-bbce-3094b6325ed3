@@ -13,6 +13,7 @@ h1{font-size:18px;margin:0}
 .badge{padding:3px 12px;border-radius:999px;font-weight:600;font-size:12px;border:1px solid var(--line)}
 .b-IDLE{background:#1f2937;color:#9ca3af}
 .b-PREPARING,.b-RECOVERING,.b-VERIFYING{background:#3b2f0b;color:var(--warn)}
+.b-SHUTTING_DOWN,.b-STOPPING{background:#2b1b3b;color:#c4b5fd}
 .b-READY{background:#052e1b;color:var(--ok)}
 .b-FAILED{background:#3b0d0d;color:var(--bad)}
 main{max-width:1180px;margin:0 auto;padding:18px;display:grid;gap:16px}
@@ -65,6 +66,17 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
         <input type="checkbox" id="injectFault"/>
         <span>注入故障：模拟 WAL 归档缺段（段 <code id="missingSeg"></code> 将被“丢失”），用于演示“未到达目标恢复点”的失败路径</span>
       </label>
+      <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:8px 0 0">
+        <span class="small mut">关闭演示停点</span>
+        <select id="closeDemo" title="在所选阶段停住，便于触发关闭并观察收尾">
+          <option value="">无（正常关闭）</option>
+          <option value="copy">复制中</option>
+          <option value="handoff">启动交接处</option>
+          <option value="replay">重放中</option>
+        </select>
+        <span class="small mut">选中的阶段会停住，此时请另行执行
+          <code>docker compose stop app</code>（或 kill 进程）观察关闭收尾。</span>
+      </div>
       <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
         <button id="startBtn" onclick="startRecovery()" disabled>启动恢复</button>
         <span class="small mut">全站同时只允许一份恢复；恢复实例为独立副本，原库不受影响</span>
@@ -111,7 +123,9 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const STATE_CN = {IDLE:'空闲',PREPARING:'准备中',RECOVERING:'WAL 重放中',VERIFYING:'校验目标中',READY:'已到达目标 · 结果开放',FAILED:'失败（进程已回收）'};
+const STATE_CN = {IDLE:'空闲',PREPARING:'准备中',RECOVERING:'WAL 重放中',VERIFYING:'校验目标中',
+  READY:'已到达目标 · 结果开放',FAILED:'失败（进程已回收）',
+  SHUTTING_DOWN:'关闭收尾：不再受理恢复',STOPPING:'关闭收尾：等待实例停止'};
 const STEPS = [
   ['PREPARING','① 复制物理基线备份 / 写入恢复配置'],
   ['RECOVERING','② 启动恢复实例，从 WAL 归档重放'],
@@ -153,6 +167,7 @@ function renderPlan(){
   $('#missingSeg').textContent = manifest.first_wal_after_backup || '';
   $('#faultWrap').style.display = 'flex';
   $('#injectFault').disabled = !idle;
+  $('#closeDemo').disabled = !idle;
   $('#startBtn').disabled = !idle;
 }
 
@@ -174,21 +189,39 @@ async function pollPrimary(){
 
 async function pollStatus(){
   let s;
-  try{ s = await api('/api/status'); }catch(e){ return; }
+  try{ s = await api('/api/status'); }catch(e){
+    // 应用正在退出：页面如实提示，不伪造 READY/结果
+    $('#stateBadge').className = 'badge b-SHUTTING_DOWN';
+    $('#stateBadge').textContent = '应用已关闭 / 无法连接';
+    $('#startBtn').disabled = true;
+    return;
+  }
   curState = s.state;
   const badge = $('#stateBadge');
   badge.className = 'badge b-' + s.state;
   badge.textContent = STATE_CN[s.state] || s.state;
   renderPlan();
   renderProgress(s);
-  $('#resultCard').classList.toggle('hidden', s.state !== 'READY');
-  $('#failedCard').classList.toggle('hidden', s.state !== 'FAILED');
-  if(s.state === 'READY') await renderResult();
-  if(s.state === 'FAILED') renderFailed(s);
+  const closing = s.closing || s.state === 'SHUTTING_DOWN' || s.state === 'STOPPING';
+  $('#resultCard').classList.toggle('hidden', closing || s.state !== 'READY');
+  $('#failedCard').classList.toggle('hidden', closing || s.state !== 'FAILED');
+  if(!closing && s.state === 'READY') await renderResult();
+  if(!closing && s.state === 'FAILED') renderFailed(s);
 }
 
 function renderProgress(s){
   const order = ['PREPARING','RECOVERING','VERIFYING','READY'];
+  const closing = s.state === 'SHUTTING_DOWN' || s.state === 'STOPPING';
+  if(closing){
+    $('#steps').innerHTML = `<div class="step err">✗ 应用正在关闭收尾：不再受理恢复；在途任务停止中，实例确认停止后删除副本</div>`;
+    $('#runMeta').innerHTML = s.run
+      ? `任务 <code>${esc(s.run.id)}</code> · 目标恢复点 <code>${esc(s.run.restore_point)}</code> · 关闭后不再开放结果`
+      : '';
+    $('#events').innerHTML = (s.run ? s.run.events.slice(-10) : []).map(e =>
+      `<div class="small mut">[${esc(e.ts)}] ${esc(e.msg)}</div>`).join('');
+    $('#logTail').textContent = '（关闭收尾中）';
+    return;
+  }
   const cur = s.state === 'FAILED' ? (s.run && s.run.error ? failStage(s) : 0) : order.indexOf(s.state);
   $('#steps').innerHTML = s.run ? STEPS.map(([k,label],i) => {
     let cls = '', icon = '○';
@@ -286,7 +319,8 @@ async function startRecovery(){
   try{
     await api('/api/recover', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({restore_point: sel.value, inject_fault: $('#injectFault').checked}),
+      body: JSON.stringify({restore_point: sel.value, inject_fault: $('#injectFault').checked,
+                            close_demo: $('#closeDemo').value || null}),
     });
     filtersInit = false;
     pollStatus();
